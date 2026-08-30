@@ -28,6 +28,14 @@
  */
 #define BOOTSTRAP_KEY "CN25_REGISTRATION_HANDSHAKE_KEY"
 
+/*
+ * Must match server.c. A fixed-width ASCII decimal length +
+ * '\n' precedes every ciphertext on the wire, so the receiver
+ * always knows exactly how many bytes make up one message,
+ * regardless of how TCP splits it across recv() calls.
+ */
+#define LENGTH_HEADER_DIGITS 10
+
 SOCKET client_socket;
 
 char client_key[MAX_KEY];
@@ -67,6 +75,177 @@ int send_all(
     }
 
     return 1;
+}
+
+
+/* ==================================================
+   Frame a length header onto `data` and send both.
+   Mirrors server.c's send_framed().
+   ================================================== */
+
+int send_framed(
+    SOCKET socket,
+    const char *data,
+    int length
+)
+{
+    char header[LENGTH_HEADER_DIGITS + 2];
+
+    snprintf(
+        header,
+        sizeof(header),
+        "%0*d\n",
+        LENGTH_HEADER_DIGITS,
+        length
+    );
+
+    if (!send_all(socket, header, (int)strlen(header))) {
+        return 0;
+    }
+
+    return send_all(socket, data, length);
+}
+
+
+/* ==================================================
+   Keep calling recv() until exactly `length` bytes
+   are read, the peer closes (0), or recv() fails
+   (negative). Mirrors server.c's recv_all().
+   ================================================== */
+
+int recv_all(
+    SOCKET socket,
+    char *buffer,
+    int length
+)
+{
+    int total = 0;
+
+    while (total < length) {
+
+        int received =
+            recv(
+                socket,
+                buffer + total,
+                length - total,
+                0
+            );
+
+        if (received <= 0) {
+            return received;
+        }
+
+        total += received;
+    }
+
+    return total;
+}
+
+
+/* ==================================================
+   Read one length-prefixed frame into `buffer`
+   (capacity `buffer_capacity`, not counting the null
+   terminator the caller adds). Returns payload bytes
+   read (not null terminated here), 0 on clean
+   disconnect, -1 on a malformed/oversized frame or a
+   socket error. Mirrors server.c's recv_framed().
+   ================================================== */
+
+int recv_framed(
+    SOCKET socket,
+    char *buffer,
+    size_t buffer_capacity
+)
+{
+    char header[LENGTH_HEADER_DIGITS + 2];
+
+    int header_bytes =
+        recv_all(
+            socket,
+            header,
+            LENGTH_HEADER_DIGITS + 1
+        );
+
+    if (header_bytes == 0) {
+        return 0;
+    }
+
+    if (header_bytes != LENGTH_HEADER_DIGITS + 1) {
+        return -1;
+    }
+
+    header[LENGTH_HEADER_DIGITS + 1] = '\0';
+
+    if (header[LENGTH_HEADER_DIGITS] != '\n') {
+        return -1;
+    }
+
+    long payload_length = atol(header);
+
+    if (payload_length < 0 ||
+        (size_t)payload_length >= buffer_capacity) {
+
+        return -1;
+    }
+
+    if (payload_length == 0) {
+        return 0;
+    }
+
+    int received =
+        recv_all(
+            socket,
+            buffer,
+            (int)payload_length
+        );
+
+    if (received != payload_length) {
+        return -1;
+    }
+
+    return received;
+}
+
+
+/* ==================================================
+   Encrypt `message` with `key` and send it as one
+   framed message. Every outgoing command (REGISTER,
+   SEND TO, SEND FILE TO, QUIT, LIST) funnels through
+   this single function so framing stays consistent.
+   ================================================== */
+
+int send_encrypted(
+    SOCKET socket,
+    const char *message,
+    const char *key
+)
+{
+    size_t encrypted_size =
+        strlen(message) * 2 + 1;
+
+    char *encrypted =
+        (char *)malloc(encrypted_size);
+
+    if (encrypted == NULL) {
+        return 0;
+    }
+
+    encrypt_text(
+        message,
+        key,
+        encrypted
+    );
+
+    int result =
+        send_framed(
+            socket,
+            encrypted,
+            (int)strlen(encrypted)
+        );
+
+    free(encrypted);
+
+    return result;
 }
 
 
@@ -237,12 +416,26 @@ DWORD WINAPI receive_messages(
     while (1) {
 
         int bytes_received =
-            recv(
+            recv_framed(
                 client_socket,
                 buffer,
-                MAX_NETWORK_BUFFER - 1,
-                0
+                MAX_NETWORK_BUFFER - 1
             );
+
+        if (bytes_received < 0) {
+
+            /*
+             * Malformed/garbage frame from the server --
+             * shouldn't happen, but the client must not
+             * crash on it either. Skip and keep listening.
+             */
+
+            printf(
+                "\nReceived a malformed frame, ignoring.\n"
+            );
+
+            continue;
+        }
 
         if (bytes_received > 0) {
 
@@ -570,6 +763,24 @@ DWORD WINAPI receive_messages(
             }
 
             /*
+             * ONLINE response (after LIST).
+             */
+
+            else if (
+                strncmp(
+                    decrypted,
+                    "ONLINE",
+                    6
+                ) == 0
+            ) {
+
+                printf(
+                    "Online users: %s\n",
+                    decrypted + 7
+                );
+            }
+
+            /*
              * Server response.
              */
 
@@ -643,42 +854,12 @@ int send_message(
         command
     );
 
-    size_t encrypted_size =
-        strlen(command) * 2 + 1;
-
-    char *encrypted =
-        (char *)malloc(
-            encrypted_size
-        );
-
-    if (encrypted == NULL) {
-
-        printf(
-            "Memory allocation failed.\n"
-        );
-
-        return 0;
-    }
-
-    encrypt_text(
-        command,
-        key,
-        encrypted
-    );
-
-    printf(
-        "Encrypted command: %s\n",
-        encrypted
-    );
-
     int result =
-        send_all(
+        send_encrypted(
             client_socket,
-            encrypted,
-            (int)strlen(encrypted)
+            command,
+            key
         );
-
-    free(encrypted);
 
     if (!result) {
 
@@ -706,45 +887,46 @@ int send_quit(
     const char *key
 )
 {
-    const char *command =
-        "QUIT";
-
-    size_t encrypted_size =
-        strlen(command) * 2 + 1;
-
-    char *encrypted =
-        (char *)malloc(
-            encrypted_size
-        );
-
-    if (encrypted == NULL) {
-
-        printf(
-            "Memory allocation failed.\n"
-        );
-
-        return 0;
-    }
-
-    encrypt_text(
-        command,
-        key,
-        encrypted
-    );
-
     int result =
-        send_all(
+        send_encrypted(
             client_socket,
-            encrypted,
-            (int)strlen(encrypted)
+            "QUIT",
+            key
         );
-
-    free(encrypted);
 
     if (!result) {
 
         printf(
             "QUIT send failed: %d\n",
+            WSAGetLastError()
+        );
+
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/* ==================================================
+   Send LIST command
+   ================================================== */
+
+int send_list(
+    const char *key
+)
+{
+    int result =
+        send_encrypted(
+            client_socket,
+            "LIST",
+            key
+        );
+
+    if (!result) {
+
+        printf(
+            "LIST send failed: %d\n",
             WSAGetLastError()
         );
 
@@ -997,52 +1179,17 @@ int send_file(
     );
 
     /*
-     * Encrypt.
-     */
-
-    size_t encrypted_size =
-        strlen(command) * 2 + 1;
-
-    char *encrypted =
-        (char *)malloc(
-            encrypted_size
-        );
-
-    if (encrypted == NULL) {
-
-        free(command);
-
-        printf(
-            "ERROR: Memory allocation failed.\n"
-        );
-
-        return 0;
-    }
-
-    encrypt_text(
-        command,
-        key,
-        encrypted
-    );
-
-    free(command);
-
-    printf(
-        "Encrypted file data prepared.\n"
-    );
-
-    /*
-     * Send.
+     * Encrypt + send as one length-prefixed frame.
      */
 
     int result =
-        send_all(
+        send_encrypted(
             client_socket,
-            encrypted,
-            (int)strlen(encrypted)
+            command,
+            key
         );
 
-    free(encrypted);
+    free(command);
 
     if (!result) {
 
@@ -1319,44 +1466,10 @@ int main(
         registration
     );
 
-    size_t reg_encrypted_size =
-        strlen(registration) * 2 + 1;
-
-    char *reg_encrypted =
-        (char *)malloc(
-            reg_encrypted_size
-        );
-
-    if (reg_encrypted == NULL) {
-
-        printf(
-            "Memory allocation failed.\n"
-        );
-
-        closesocket(
-            client_socket
-        );
-
-        WSACleanup();
-
-        return 1;
-    }
-
-    encrypt_text(
-        registration,
-        BOOTSTRAP_KEY,
-        reg_encrypted
-    );
-
-    printf(
-        "Encrypted registration: %s\n",
-        reg_encrypted
-    );
-
-    if (!send_all(
+    if (!send_encrypted(
             client_socket,
-            reg_encrypted,
-            (int)strlen(reg_encrypted)
+            registration,
+            BOOTSTRAP_KEY
         )) {
 
         printf(
@@ -1364,8 +1477,6 @@ int main(
             WSAGetLastError()
         );
 
-        free(reg_encrypted);
-
         closesocket(
             client_socket
         );
@@ -1374,8 +1485,6 @@ int main(
 
         return 1;
     }
-
-    free(reg_encrypted);
 
     printf(
         "Registration sent.\n"
@@ -1396,18 +1505,18 @@ int main(
     ];
 
     int bytes_received =
-        recv(
+        recv_framed(
             client_socket,
             registration_response,
-            BUFFER_SIZE - 1,
-            0
+            BUFFER_SIZE - 1
         );
 
     if (bytes_received <= 0) {
 
         printf(
-            "Registration response failed: %d\n",
-            WSAGetLastError()
+            bytes_received == 0
+                ? "Server closed the connection during registration.\n"
+                : "Malformed registration response frame.\n"
         );
 
         closesocket(
@@ -1488,6 +1597,12 @@ int main(
 
     printf(
         "\nConnection is open.\n"
+    );
+
+    printf(
+        "Commands: /list to see online users, "
+        "/file <path> to send a .txt file, "
+        "/quit to disconnect.\n"
     );
 
     /*
@@ -1590,6 +1705,22 @@ int main(
             Sleep(200);
 
             break;
+        }
+
+        /*
+         * List online users.
+         */
+
+        if (
+            strcmp(
+                input,
+                "/list"
+            ) == 0
+        ) {
+
+            send_list(key);
+
+            continue;
         }
 
         /*
