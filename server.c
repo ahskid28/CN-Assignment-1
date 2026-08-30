@@ -24,6 +24,20 @@
  */
 #define MAX_NETWORK_BUFFER (MAX_FILE_HEX_SIZE * 2 + 4096)
 
+/*
+ * Fixed handshake key, shared by client and server, used ONLY to
+ * encrypt the REGISTER command and its REGISTERED/ERROR response.
+ *
+ * The server cannot know a client's real key until it has read
+ * and parsed the REGISTER command, so that command cannot be
+ * encrypted with the real key. Every other message (chat, file
+ * transfer, ordinary server responses) is still encrypted with
+ * the client's own registered key as before.
+ *
+ * This MUST match the BOOTSTRAP_KEY defined in client.c.
+ */
+#define BOOTSTRAP_KEY "CN25_REGISTRATION_HANDSHAKE_KEY"
+
 typedef struct {
     SOCKET socket;
     char username[MAX_USERNAME];
@@ -931,6 +945,17 @@ DWORD WINAPI handle_client(
     ];
 
 
+    /*
+     * Decrypted copy of the registration buffer.
+     * Encrypted with BOOTSTRAP_KEY, not the
+     * client's own key (which is not yet known).
+     */
+
+    char decrypted_registration[
+        BUFFER_SIZE
+    ];
+
+
     char username[
         MAX_USERNAME
     ];
@@ -978,9 +1003,28 @@ DWORD WINAPI handle_client(
     ] = '\0';
 
 
+    /*
+     * ----------------------------------------------
+     * Decrypt registration with BOOTSTRAP_KEY.
+     *
+     * The REGISTER command carries the client's real
+     * key, so it cannot itself be encrypted with that
+     * key (the server doesn't know it yet). It is
+     * encrypted with a fixed, shared bootstrap key
+     * instead, matching client.c.
+     * ----------------------------------------------
+     */
+
+    decrypt_text(
+        registration_buffer,
+        BOOTSTRAP_KEY,
+        decrypted_registration
+    );
+
+
     printf(
         "Received registration: %s\n",
-        registration_buffer
+        decrypted_registration
     );
 
 
@@ -993,20 +1037,16 @@ DWORD WINAPI handle_client(
      */
 
     if (sscanf(
-            registration_buffer,
+            decrypted_registration,
             "REGISTER %49s KEY %49s",
             username,
             key
         ) != 2) {
 
-        const char *response =
-            "ERROR invalid registration format";
-
-
-        send_all(
+        send_encrypted(
             client_socket,
-            response,
-            (int)strlen(response)
+            "ERROR invalid registration format",
+            BOOTSTRAP_KEY
         );
 
 
@@ -1042,10 +1082,10 @@ DWORD WINAPI handle_client(
         );
 
 
-        send_all(
+        send_encrypted(
             client_socket,
             response,
-            (int)strlen(response)
+            BOOTSTRAP_KEY
         );
 
 
@@ -1069,14 +1109,10 @@ DWORD WINAPI handle_client(
 
     if (client_index == -1) {
 
-        const char *response =
-            "ERROR server full";
-
-
-        send_all(
+        send_encrypted(
             client_socket,
-            response,
-            (int)strlen(response)
+            "ERROR server full",
+            BOOTSTRAP_KEY
         );
 
 
@@ -1123,6 +1159,11 @@ DWORD WINAPI handle_client(
     /*
      * ----------------------------------------------
      * Registration response
+     *
+     * Still sent with BOOTSTRAP_KEY: this is the
+     * last message in the handshake exchange, and
+     * mirroring the client's expectations keeps the
+     * encryption scheme for this exchange symmetric.
      * ----------------------------------------------
      */
 
@@ -1139,10 +1180,10 @@ DWORD WINAPI handle_client(
     );
 
 
-    if (!send_all(
+    if (!send_encrypted(
             client_socket,
             response,
-            (int)strlen(response)
+            BOOTSTRAP_KEY
         )) {
 
         printf(
@@ -1211,6 +1252,10 @@ DWORD WINAPI handle_client(
      * Keep connection open
      * ----------------------------------------------
      */
+
+    int client_quit =
+        0;
+
 
     while (1) {
 
@@ -1316,6 +1361,55 @@ DWORD WINAPI handle_client(
 
         /*
          * ------------------------------------------
+         * QUIT
+         *
+         * Client-requested graceful disconnect.
+         * Reply GOODBYE <username>, then break out
+         * of the loop so the usual cleanup path
+         * below runs.
+         * ------------------------------------------
+         */
+
+        if (
+            strcmp(
+                decrypted,
+                "QUIT"
+            ) == 0
+        ) {
+
+            char goodbye[BUFFER_SIZE];
+
+            snprintf(
+                goodbye,
+                sizeof(goodbye),
+                "GOODBYE %s",
+                username
+            );
+
+            send_encrypted(
+                client_socket,
+                goodbye,
+                clients[client_index].key
+            );
+
+            printf(
+                "Client %s sent QUIT.\n",
+                username
+            );
+
+            free(
+                decrypted
+            );
+
+            client_quit =
+                1;
+
+            break;
+        }
+
+
+        /*
+         * ------------------------------------------
          * Normal message
          * ------------------------------------------
          */
@@ -1381,8 +1475,16 @@ DWORD WINAPI handle_client(
     /*
      * ----------------------------------------------
      * Client disconnected
+     *
+     * Reached either after a QUIT (graceful, with
+     * GOODBYE already sent above) or after recv()
+     * returned <= 0 (abrupt disconnect / error).
+     * Cleanup is identical either way.
      * ----------------------------------------------
      */
+
+    (void)client_quit;
+
 
     free(
         buffer
