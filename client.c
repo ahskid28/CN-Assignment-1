@@ -16,6 +16,18 @@
 
 #define MAX_NETWORK_BUFFER (MAX_FILE_HEX_SIZE * 2 + 4096)
 
+/*
+ * Fixed handshake key, shared by client and server, used ONLY to
+ * encrypt the REGISTER command and its REGISTERED/ERROR response.
+ *
+ * This solves the bootstrap problem: the server cannot know a
+ * client's real key until it reads the REGISTER command, so that
+ * command cannot be encrypted with the real key. Every other
+ * message (chat, file transfer, ordinary server responses) is
+ * still encrypted with the client's own registered key as before.
+ */
+#define BOOTSTRAP_KEY "CN25_REGISTRATION_HANDSHAKE_KEY"
+
 SOCKET client_socket;
 
 char client_key[MAX_KEY];
@@ -71,9 +83,7 @@ void binary_to_hex(
     const char digits[] =
         "0123456789ABCDEF";
 
-
     size_t i;
-
 
     for (i = 0; i < length; i++) {
 
@@ -82,13 +92,11 @@ void binary_to_hex(
                 (data[i] >> 4) & 0x0F
             ];
 
-
         hex[i * 2 + 1] =
             digits[
                 data[i] & 0x0F
             ];
     }
-
 
     hex[length * 2] =
         '\0';
@@ -126,23 +134,18 @@ int hex_to_binary(
     size_t hex_length =
         strlen(hex);
 
-
     if (hex_length % 2 != 0) {
         return 0;
     }
 
-
     size_t binary_length =
         hex_length / 2;
-
 
     if (binary_length > data_size) {
         return 0;
     }
 
-
     size_t i;
-
 
     for (i = 0; i < binary_length; i++) {
 
@@ -151,24 +154,20 @@ int hex_to_binary(
                 hex[i * 2]
             );
 
-
         int low =
             hex_value(
                 hex[i * 2 + 1]
             );
 
-
         if (high < 0 || low < 0) {
             return 0;
         }
-
 
         data[i] =
             (unsigned char)(
                 (high << 4) | low
             );
     }
-
 
     return 1;
 }
@@ -185,10 +184,8 @@ const char *get_filename(
     const char *slash =
         strrchr(path, '\\');
 
-
     const char *forward_slash =
         strrchr(path, '/');
-
 
     if (
         forward_slash != NULL &&
@@ -201,11 +198,9 @@ const char *get_filename(
         return forward_slash + 1;
     }
 
-
     if (slash != NULL) {
         return slash + 1;
     }
-
 
     return path;
 }
@@ -221,7 +216,6 @@ DWORD WINAPI receive_messages(
 {
     (void)parameter;
 
-
     /*
      * Large buffer is on heap, NOT stack.
      */
@@ -231,7 +225,6 @@ DWORD WINAPI receive_messages(
             MAX_NETWORK_BUFFER
         );
 
-
     if (buffer == NULL) {
 
         printf(
@@ -240,7 +233,6 @@ DWORD WINAPI receive_messages(
 
         return 0;
     }
-
 
     while (1) {
 
@@ -252,13 +244,11 @@ DWORD WINAPI receive_messages(
                 0
             );
 
-
         if (bytes_received > 0) {
 
             buffer[
                 bytes_received
             ] = '\0';
-
 
             /*
              * Display received ciphertext.
@@ -280,7 +270,6 @@ DWORD WINAPI receive_messages(
                 );
             }
 
-
             /*
              * Decryption buffer.
              */
@@ -288,12 +277,10 @@ DWORD WINAPI receive_messages(
             size_t decrypted_size =
                 (size_t)bytes_received / 2 + 1;
 
-
             char *decrypted =
                 (char *)malloc(
                     decrypted_size
                 );
-
 
             if (decrypted == NULL) {
 
@@ -304,13 +291,11 @@ DWORD WINAPI receive_messages(
                 continue;
             }
 
-
             decrypt_text(
                 buffer,
                 client_key,
                 decrypted
             );
-
 
             /*
              * Normal message.
@@ -330,7 +315,6 @@ DWORD WINAPI receive_messages(
                 );
             }
 
-
             /*
              * File received.
              */
@@ -349,7 +333,6 @@ DWORD WINAPI receive_messages(
                         ':'
                     );
 
-
                 if (colon == NULL) {
 
                     printf(
@@ -361,22 +344,18 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 const char *file_info =
                     colon + 1;
-
 
                 while (*file_info == ' ') {
                     file_info++;
                 }
-
 
                 const char *separator =
                     strchr(
                         file_info,
                         '|'
                     );
-
 
                 if (separator == NULL) {
 
@@ -389,7 +368,6 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 /*
                  * Filename.
                  */
@@ -398,7 +376,6 @@ DWORD WINAPI receive_messages(
                     (size_t)(
                         separator - file_info
                     );
-
 
                 if (
                     filename_length == 0 ||
@@ -414,9 +391,7 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 char filename[MAX_PATH];
-
 
                 memcpy(
                     filename,
@@ -424,11 +399,9 @@ DWORD WINAPI receive_messages(
                     filename_length
                 );
 
-
                 filename[
                     filename_length
                 ] = '\0';
-
 
                 /*
                  * Hexadecimal file data.
@@ -437,10 +410,8 @@ DWORD WINAPI receive_messages(
                 const char *hex_data =
                     separator + 1;
 
-
                 size_t hex_length =
                     strlen(hex_data);
-
 
                 if (hex_length % 2 != 0) {
 
@@ -453,10 +424,8 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 size_t file_size =
                     hex_length / 2;
-
 
                 if (
                     file_size >
@@ -472,7 +441,6 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 /*
                  * Decode file.
                  */
@@ -481,7 +449,6 @@ DWORD WINAPI receive_messages(
                     (unsigned char *)malloc(
                         file_size + 1
                     );
-
 
                 if (file_data == NULL) {
 
@@ -493,7 +460,6 @@ DWORD WINAPI receive_messages(
 
                     continue;
                 }
-
 
                 if (!hex_to_binary(
                         hex_data,
@@ -511,7 +477,6 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 /*
                  * Strip directory information.
                  */
@@ -521,7 +486,6 @@ DWORD WINAPI receive_messages(
                         filename
                     );
 
-
                 /*
                  * Save as received_filename.
                  */
@@ -530,7 +494,6 @@ DWORD WINAPI receive_messages(
                     MAX_PATH + 20
                 ];
 
-
                 snprintf(
                     output_filename,
                     sizeof(output_filename),
@@ -538,13 +501,11 @@ DWORD WINAPI receive_messages(
                     safe_filename
                 );
 
-
                 FILE *output =
                     fopen(
                         output_filename,
                         "wb"
                     );
-
 
                 if (output == NULL) {
 
@@ -558,7 +519,6 @@ DWORD WINAPI receive_messages(
                     continue;
                 }
 
-
                 size_t written =
                     fwrite(
                         file_data,
@@ -567,9 +527,7 @@ DWORD WINAPI receive_messages(
                         output
                     );
 
-
                 fclose(output);
-
 
                 if (written != file_size) {
 
@@ -590,10 +548,26 @@ DWORD WINAPI receive_messages(
                     );
                 }
 
-
                 free(file_data);
             }
 
+            /*
+             * GOODBYE response (after QUIT).
+             */
+
+            else if (
+                strncmp(
+                    decrypted,
+                    "GOODBYE ",
+                    8
+                ) == 0
+            ) {
+
+                printf(
+                    "Server response: %s\n",
+                    decrypted
+                );
+            }
 
             /*
              * Server response.
@@ -607,9 +581,7 @@ DWORD WINAPI receive_messages(
                 );
             }
 
-
             free(decrypted);
-
 
             printf(
                 "\nEnter message to send: "
@@ -617,7 +589,6 @@ DWORD WINAPI receive_messages(
 
             fflush(stdout);
         }
-
 
         else if (bytes_received == 0) {
 
@@ -627,7 +598,6 @@ DWORD WINAPI receive_messages(
 
             break;
         }
-
 
         else {
 
@@ -639,7 +609,6 @@ DWORD WINAPI receive_messages(
             break;
         }
     }
-
 
     free(buffer);
 
@@ -661,7 +630,6 @@ int send_message(
         BUFFER_SIZE
     ];
 
-
     snprintf(
         command,
         sizeof(command),
@@ -670,22 +638,18 @@ int send_message(
         message
     );
 
-
     printf(
         "Plaintext command: %s\n",
         command
     );
 
-
     size_t encrypted_size =
         strlen(command) * 2 + 1;
-
 
     char *encrypted =
         (char *)malloc(
             encrypted_size
         );
-
 
     if (encrypted == NULL) {
 
@@ -696,19 +660,16 @@ int send_message(
         return 0;
     }
 
-
     encrypt_text(
         command,
         key,
         encrypted
     );
 
-
     printf(
         "Encrypted command: %s\n",
         encrypted
     );
-
 
     int result =
         send_all(
@@ -717,9 +678,7 @@ int send_message(
             (int)strlen(encrypted)
         );
 
-
     free(encrypted);
-
 
     if (!result) {
 
@@ -731,11 +690,66 @@ int send_message(
         return 0;
     }
 
-
     printf(
         "Encrypted command sent.\n"
     );
 
+    return 1;
+}
+
+
+/* ==================================================
+   Send QUIT command
+   ================================================== */
+
+int send_quit(
+    const char *key
+)
+{
+    const char *command =
+        "QUIT";
+
+    size_t encrypted_size =
+        strlen(command) * 2 + 1;
+
+    char *encrypted =
+        (char *)malloc(
+            encrypted_size
+        );
+
+    if (encrypted == NULL) {
+
+        printf(
+            "Memory allocation failed.\n"
+        );
+
+        return 0;
+    }
+
+    encrypt_text(
+        command,
+        key,
+        encrypted
+    );
+
+    int result =
+        send_all(
+            client_socket,
+            encrypted,
+            (int)strlen(encrypted)
+        );
+
+    free(encrypted);
+
+    if (!result) {
+
+        printf(
+            "QUIT send failed: %d\n",
+            WSAGetLastError()
+        );
+
+        return 0;
+    }
 
     return 1;
 }
@@ -758,7 +772,6 @@ int send_file(
     const char *extension =
         strrchr(path, '.');
 
-
     if (
         extension == NULL ||
         _stricmp(extension, ".txt") != 0
@@ -771,7 +784,6 @@ int send_file(
         return 0;
     }
 
-
     /*
      * Open file.
      */
@@ -782,7 +794,6 @@ int send_file(
             "rb"
         );
 
-
     if (file == NULL) {
 
         printf(
@@ -791,7 +802,6 @@ int send_file(
 
         return 0;
     }
-
 
     /*
      * Get file size.
@@ -814,10 +824,8 @@ int send_file(
         return 0;
     }
 
-
     long file_size_long =
         ftell(file);
-
 
     if (file_size_long < 0) {
 
@@ -829,7 +837,6 @@ int send_file(
 
         return 0;
     }
-
 
     /*
      * 1 MB limit.
@@ -849,7 +856,6 @@ int send_file(
         return 0;
     }
 
-
     if (
         fseek(
             file,
@@ -867,10 +873,8 @@ int send_file(
         return 0;
     }
 
-
     size_t file_size =
         (size_t)file_size_long;
-
 
     /*
      * Allocate file.
@@ -880,7 +884,6 @@ int send_file(
         (unsigned char *)malloc(
             file_size + 1
         );
-
 
     if (file_data == NULL) {
 
@@ -893,7 +896,6 @@ int send_file(
         return 0;
     }
 
-
     size_t bytes_read =
         fread(
             file_data,
@@ -902,9 +904,7 @@ int send_file(
             file
         );
 
-
     fclose(file);
-
 
     if (bytes_read != file_size) {
 
@@ -917,7 +917,6 @@ int send_file(
         return 0;
     }
 
-
     /*
      * Convert to hex.
      */
@@ -925,12 +924,10 @@ int send_file(
     size_t hex_size =
         file_size * 2 + 1;
 
-
     char *hex_data =
         (char *)malloc(
             hex_size
         );
-
 
     if (hex_data == NULL) {
 
@@ -943,16 +940,13 @@ int send_file(
         return 0;
     }
 
-
     binary_to_hex(
         file_data,
         file_size,
         hex_data
     );
 
-
     free(file_data);
-
 
     /*
      * Only transmit filename.
@@ -960,7 +954,6 @@ int send_file(
 
     const char *filename =
         get_filename(path);
-
 
     /*
      * Build command.
@@ -972,12 +965,10 @@ int send_file(
         strlen(hex_data) +
         32;
 
-
     char *command =
         (char *)malloc(
             command_size
         );
-
 
     if (command == NULL) {
 
@@ -990,7 +981,6 @@ int send_file(
         return 0;
     }
 
-
     snprintf(
         command,
         command_size,
@@ -1000,14 +990,11 @@ int send_file(
         hex_data
     );
 
-
     free(hex_data);
-
 
     printf(
         "Plaintext file command prepared.\n"
     );
-
 
     /*
      * Encrypt.
@@ -1016,12 +1003,10 @@ int send_file(
     size_t encrypted_size =
         strlen(command) * 2 + 1;
 
-
     char *encrypted =
         (char *)malloc(
             encrypted_size
         );
-
 
     if (encrypted == NULL) {
 
@@ -1034,21 +1019,17 @@ int send_file(
         return 0;
     }
 
-
     encrypt_text(
         command,
         key,
         encrypted
     );
 
-
     free(command);
-
 
     printf(
         "Encrypted file data prepared.\n"
     );
-
 
     /*
      * Send.
@@ -1061,9 +1042,7 @@ int send_file(
             (int)strlen(encrypted)
         );
 
-
     free(encrypted);
-
 
     if (!result) {
 
@@ -1075,11 +1054,9 @@ int send_file(
         return 0;
     }
 
-
     printf(
         "Encrypted file sent.\n"
     );
-
 
     return 1;
 }
@@ -1108,14 +1085,11 @@ int main(
         return 1;
     }
 
-
     const char *server_ip =
         argv[1];
 
-
     int port =
         atoi(argv[2]);
-
 
     /*
      * Username.
@@ -1125,14 +1099,11 @@ int main(
         MAX_USERNAME
     ];
 
-
     printf(
         "Enter username: "
     );
 
-
     fflush(stdout);
-
 
     if (
         fgets(
@@ -1145,14 +1116,12 @@ int main(
         return 1;
     }
 
-
     username[
         strcspn(
             username,
             "\r\n"
         )
     ] = '\0';
-
 
     /*
      * Encryption key.
@@ -1162,14 +1131,11 @@ int main(
         MAX_KEY
     ];
 
-
     printf(
         "Enter encryption key: "
     );
 
-
     fflush(stdout);
-
 
     if (
         fgets(
@@ -1182,7 +1148,6 @@ int main(
         return 1;
     }
 
-
     key[
         strcspn(
             key,
@@ -1190,12 +1155,10 @@ int main(
         )
     ] = '\0';
 
-
     strcpy(
         client_key,
         key
     );
-
 
     /*
      * Winsock.
@@ -1203,13 +1166,11 @@ int main(
 
     WSADATA wsaData;
 
-
     int result =
         WSAStartup(
             MAKEWORD(2, 2),
             &wsaData
         );
-
 
     if (result != 0) {
 
@@ -1221,11 +1182,9 @@ int main(
         return 1;
     }
 
-
     printf(
         "Winsock initialized.\n"
     );
-
 
     /*
      * Create socket.
@@ -1238,7 +1197,6 @@ int main(
             IPPROTO_TCP
         );
 
-
     if (
         client_socket ==
         INVALID_SOCKET
@@ -1249,17 +1207,14 @@ int main(
             WSAGetLastError()
         );
 
-
         WSACleanup();
 
         return 1;
     }
 
-
     printf(
         "Client socket created.\n"
     );
-
 
     /*
      * Server address.
@@ -1267,27 +1222,22 @@ int main(
 
     struct sockaddr_in server_address;
 
-
     memset(
         &server_address,
         0,
         sizeof(server_address)
     );
 
-
     server_address.sin_family =
         AF_INET;
-
 
     server_address.sin_port =
         htons(
             (u_short)port
         );
 
-
     server_address.sin_addr.s_addr =
         inet_addr(server_ip);
-
 
     if (
         server_address.sin_addr.s_addr
@@ -1298,17 +1248,14 @@ int main(
             "Invalid server IP address.\n"
         );
 
-
         closesocket(
             client_socket
         );
-
 
         WSACleanup();
 
         return 1;
     }
-
 
     /*
      * Connect.
@@ -1321,7 +1268,6 @@ int main(
             sizeof(server_address)
         );
 
-
     if (
         result ==
         SOCKET_ERROR
@@ -1332,31 +1278,33 @@ int main(
             WSAGetLastError()
         );
 
-
         closesocket(
             client_socket
         );
-
 
         WSACleanup();
 
         return 1;
     }
 
-
     printf(
         "Connected to server.\n"
     );
 
-
     /*
-     * Registration.
+     * ----------------------------------------------
+     * Registration
+     *
+     * The REGISTER command carries the client's real
+     * key, so it cannot be encrypted with that key
+     * (the server doesn't know it yet). Instead it is
+     * encrypted with a fixed, shared BOOTSTRAP_KEY.
+     * ----------------------------------------------
      */
 
     char registration[
         BUFFER_SIZE
     ];
-
 
     snprintf(
         registration,
@@ -1366,11 +1314,49 @@ int main(
         key
     );
 
+    printf(
+        "Plaintext registration: %s\n",
+        registration
+    );
+
+    size_t reg_encrypted_size =
+        strlen(registration) * 2 + 1;
+
+    char *reg_encrypted =
+        (char *)malloc(
+            reg_encrypted_size
+        );
+
+    if (reg_encrypted == NULL) {
+
+        printf(
+            "Memory allocation failed.\n"
+        );
+
+        closesocket(
+            client_socket
+        );
+
+        WSACleanup();
+
+        return 1;
+    }
+
+    encrypt_text(
+        registration,
+        BOOTSTRAP_KEY,
+        reg_encrypted
+    );
+
+    printf(
+        "Encrypted registration: %s\n",
+        reg_encrypted
+    );
 
     if (!send_all(
             client_socket,
-            registration,
-            (int)strlen(registration)
+            reg_encrypted,
+            (int)strlen(reg_encrypted)
         )) {
 
         printf(
@@ -1378,32 +1364,36 @@ int main(
             WSAGetLastError()
         );
 
+        free(reg_encrypted);
 
         closesocket(
             client_socket
         );
-
 
         WSACleanup();
 
         return 1;
     }
 
+    free(reg_encrypted);
 
     printf(
-        "Registration sent: %s\n",
-        registration
+        "Registration sent.\n"
     );
 
-
     /*
-     * Registration response.
+     * ----------------------------------------------
+     * Registration response
+     *
+     * Also encrypted with BOOTSTRAP_KEY, since the
+     * server does not yet trust/store this client's
+     * real key at the point it sends this reply.
+     * ----------------------------------------------
      */
 
     char registration_response[
         BUFFER_SIZE
     ];
-
 
     int bytes_received =
         recv(
@@ -1413,7 +1403,6 @@ int main(
             0
         );
 
-
     if (bytes_received <= 0) {
 
         printf(
@@ -1421,32 +1410,56 @@ int main(
             WSAGetLastError()
         );
 
-
         closesocket(
             client_socket
         );
-
 
         WSACleanup();
 
         return 1;
     }
 
-
     registration_response[
         bytes_received
     ] = '\0';
 
+    size_t reg_resp_decrypted_size =
+        (size_t)bytes_received / 2 + 1;
+
+    char *reg_resp_decrypted =
+        (char *)malloc(
+            reg_resp_decrypted_size
+        );
+
+    if (reg_resp_decrypted == NULL) {
+
+        printf(
+            "Memory allocation failed.\n"
+        );
+
+        closesocket(
+            client_socket
+        );
+
+        WSACleanup();
+
+        return 1;
+    }
+
+    decrypt_text(
+        registration_response,
+        BOOTSTRAP_KEY,
+        reg_resp_decrypted
+    );
 
     printf(
         "Server response: %s\n",
-        registration_response
+        reg_resp_decrypted
     );
-
 
     if (
         strncmp(
-            registration_response,
+            reg_resp_decrypted,
             "REGISTERED",
             10
         ) != 0
@@ -1456,27 +1469,26 @@ int main(
             "Registration failed.\n"
         );
 
+        free(reg_resp_decrypted);
 
         closesocket(
             client_socket
         );
-
 
         WSACleanup();
 
         return 1;
     }
 
+    free(reg_resp_decrypted);
 
     printf(
         "Registration successful!\n"
     );
 
-
     printf(
         "\nConnection is open.\n"
     );
-
 
     /*
      * Start receiver thread.
@@ -1492,24 +1504,20 @@ int main(
             NULL
         );
 
-
     if (receive_thread == NULL) {
 
         printf(
             "Failed to create receive thread.\n"
         );
 
-
         closesocket(
             client_socket
         );
-
 
         WSACleanup();
 
         return 1;
     }
-
 
     /*
      * Main input loop.
@@ -1519,16 +1527,13 @@ int main(
         BUFFER_SIZE
     ];
 
-
     while (1) {
 
         printf(
             "\nEnter message to send: "
         );
 
-
         fflush(stdout);
-
 
         if (
             fgets(
@@ -1541,14 +1546,12 @@ int main(
             break;
         }
 
-
         input[
             strcspn(
                 input,
                 "\r\n"
             )
         ] = '\0';
-
 
         if (
             strlen(input) == 0
@@ -1557,9 +1560,12 @@ int main(
             continue;
         }
 
-
         /*
          * Quit.
+         *
+         * Sends an encrypted QUIT command so the server
+         * can reply with GOODBYE <username> per the
+         * protocol, instead of just dropping the socket.
          */
 
         if (
@@ -1573,9 +1579,18 @@ int main(
                 "Disconnecting...\n"
             );
 
+            send_quit(key);
+
+            /*
+             * Give the receive thread a moment to print
+             * the GOODBYE reply before we tear the
+             * connection down below.
+             */
+
+            Sleep(200);
+
             break;
         }
-
 
         /*
          * File transfer:
@@ -1599,18 +1614,15 @@ int main(
                 MAX_PATH
             ];
 
-
             strncpy(
                 path,
                 input + 6,
                 sizeof(path) - 1
             );
 
-
             path[
                 sizeof(path) - 1
             ] = '\0';
-
 
             /*
              * Remove surrounding quotes.
@@ -1618,7 +1630,6 @@ int main(
 
             size_t path_length =
                 strlen(path);
-
 
             if (
                 path_length >= 2 &&
@@ -1632,12 +1643,10 @@ int main(
                     path_length - 2
                 );
 
-
                 path[
                     path_length - 2
                 ] = '\0';
             }
-
 
             /*
              * Ask recipient.
@@ -1647,14 +1656,11 @@ int main(
                 MAX_USERNAME
             ];
 
-
             printf(
                 "Send file to username: "
             );
 
-
             fflush(stdout);
-
 
             if (
                 fgets(
@@ -1667,14 +1673,12 @@ int main(
                 break;
             }
 
-
             target_username[
                 strcspn(
                     target_username,
                     "\r\n"
                 )
             ] = '\0';
-
 
             if (
                 strlen(target_username) == 0
@@ -1687,17 +1691,14 @@ int main(
                 continue;
             }
 
-
             send_file(
                 path,
                 target_username,
                 key
             );
 
-
             continue;
         }
-
 
         /*
          * Normal message.
@@ -1707,14 +1708,11 @@ int main(
             MAX_USERNAME
         ];
 
-
         printf(
             "Send to username: "
         );
 
-
         fflush(stdout);
-
 
         if (
             fgets(
@@ -1727,14 +1725,12 @@ int main(
             break;
         }
 
-
         target_username[
             strcspn(
                 target_username,
                 "\r\n"
             )
         ] = '\0';
-
 
         if (
             strlen(target_username) == 0
@@ -1747,14 +1743,12 @@ int main(
             continue;
         }
 
-
         send_message(
             input,
             target_username,
             key
         );
     }
-
 
     /*
      * Close connection.
@@ -1765,11 +1759,9 @@ int main(
         SD_BOTH
     );
 
-
     closesocket(
         client_socket
     );
-
 
     /*
      * Give receive thread time to exit.
@@ -1780,19 +1772,15 @@ int main(
         1000
     );
 
-
     CloseHandle(
         receive_thread
     );
 
-
     WSACleanup();
-
 
     printf(
         "Client disconnected.\n"
     );
-
 
     return 0;
 }
