@@ -38,6 +38,16 @@
  */
 #define BOOTSTRAP_KEY "CN25_REGISTRATION_HANDSHAKE_KEY"
 
+/*
+ * Length-prefix used to frame every message on the wire.
+ * A fixed-width ASCII decimal length + '\n' precedes the
+ * ciphertext, so the receiver always knows exactly how many
+ * bytes to read for one message, even if it arrives split
+ * across several TCP segments/recv() calls (e.g. large file
+ * transfers).
+ */
+#define LENGTH_HEADER_DIGITS 10
+
 typedef struct {
     SOCKET socket;
     char username[MAX_USERNAME];
@@ -47,6 +57,14 @@ typedef struct {
 
 ClientInfo clients[MAX_CLIENTS];
 
+/*
+ * Guards all reads/writes of the shared `clients` array, since
+ * every connected client is served by its own thread. Any code
+ * that scans, reads, or mutates `clients[]` must hold this lock
+ * for the duration of that access.
+ */
+CRITICAL_SECTION clients_lock;
+
 
 /* ==================================================
    Find client by username
@@ -55,17 +73,23 @@ ClientInfo clients[MAX_CLIENTS];
 int find_client_by_username(const char *username)
 {
     int i;
+    int found = -1;
+
+    EnterCriticalSection(&clients_lock);
 
     for (i = 0; i < MAX_CLIENTS; i++) {
 
         if (clients[i].active &&
             strcmp(clients[i].username, username) == 0) {
 
-            return i;
+            found = i;
+            break;
         }
     }
 
-    return -1;
+    LeaveCriticalSection(&clients_lock);
+
+    return found;
 }
 
 
@@ -76,15 +100,59 @@ int find_client_by_username(const char *username)
 int find_free_client(void)
 {
     int i;
+    int found = -1;
+
+    EnterCriticalSection(&clients_lock);
 
     for (i = 0; i < MAX_CLIENTS; i++) {
 
         if (!clients[i].active) {
-            return i;
+            found = i;
+            break;
         }
     }
 
-    return -1;
+    LeaveCriticalSection(&clients_lock);
+
+    return found;
+}
+
+
+/* ==================================================
+   Snapshot a client's socket + key under the lock.
+
+   handle_send_command / handle_file_command need the
+   target's socket and key to encrypt/deliver a message.
+   Instead of holding clients_lock across the (possibly
+   slow) send() call, we copy out just the two fields we
+   need while holding the lock, then release it before
+   touching the network.
+   ================================================== */
+
+int snapshot_client(
+    int index,
+    SOCKET *out_socket,
+    char *out_key,
+    size_t out_key_size
+)
+{
+    int ok = 0;
+
+    EnterCriticalSection(&clients_lock);
+
+    if (index >= 0 && index < MAX_CLIENTS && clients[index].active) {
+
+        *out_socket = clients[index].socket;
+
+        strncpy(out_key, clients[index].key, out_key_size - 1);
+        out_key[out_key_size - 1] = '\0';
+
+        ok = 1;
+    }
+
+    LeaveCriticalSection(&clients_lock);
+
+    return ok;
 }
 
 
@@ -125,6 +193,141 @@ int send_all(
 
 
 /* ==================================================
+   Frame a fixed-size length header onto `data` and
+   send both. Every message on the wire goes through
+   this, so the receiver can always tell exactly how
+   many payload bytes to read regardless of how TCP
+   happens to split it across recv() calls.
+   ================================================== */
+
+int send_framed(
+    SOCKET socket,
+    const char *data,
+    int length
+)
+{
+    char header[LENGTH_HEADER_DIGITS + 2];
+
+    snprintf(
+        header,
+        sizeof(header),
+        "%0*d\n",
+        LENGTH_HEADER_DIGITS,
+        length
+    );
+
+    if (!send_all(socket, header, (int)strlen(header))) {
+        return 0;
+    }
+
+    return send_all(socket, data, length);
+}
+
+
+/* ==================================================
+   Keep calling recv() until exactly `length` bytes
+   have been read, `length` == 0 (nothing to read),
+   the peer closes the connection (0), or recv() fails
+   (negative). This is what makes recv_framed() safe
+   for payloads that arrive split across many packets.
+   ================================================== */
+
+int recv_all(
+    SOCKET socket,
+    char *buffer,
+    int length
+)
+{
+    int total = 0;
+
+    while (total < length) {
+
+        int received =
+            recv(
+                socket,
+                buffer + total,
+                length - total,
+                0
+            );
+
+        if (received <= 0) {
+            return received;
+        }
+
+        total += received;
+    }
+
+    return total;
+}
+
+
+/* ==================================================
+   Read one length-prefixed frame into `buffer`
+   (capacity `buffer_capacity`, NOT including the
+   caller's null terminator byte). Returns the number
+   of payload bytes read (buffer is NOT null
+   terminated by this function), 0 on a clean
+   disconnect, or -1 on a malformed header, an
+   oversized frame, or a socket error.
+   ================================================== */
+
+int recv_framed(
+    SOCKET socket,
+    char *buffer,
+    size_t buffer_capacity
+)
+{
+    char header[LENGTH_HEADER_DIGITS + 2];
+
+    int header_bytes =
+        recv_all(
+            socket,
+            header,
+            LENGTH_HEADER_DIGITS + 1
+        );
+
+    if (header_bytes == 0) {
+        return 0;
+    }
+
+    if (header_bytes != LENGTH_HEADER_DIGITS + 1) {
+        return -1;
+    }
+
+    header[LENGTH_HEADER_DIGITS + 1] = '\0';
+
+    if (header[LENGTH_HEADER_DIGITS] != '\n') {
+        return -1;
+    }
+
+    long payload_length = atol(header);
+
+    if (payload_length < 0 ||
+        (size_t)payload_length >= buffer_capacity) {
+
+        return -1;
+    }
+
+    if (payload_length == 0) {
+        return 0;
+    }
+
+    int received =
+        recv_all(
+            socket,
+            buffer,
+            (int)payload_length
+        );
+
+    if (received != payload_length) {
+        return -1;
+    }
+
+    return received;
+}
+
+
+/* ==================================================
    Send encrypted message
    ================================================== */
 
@@ -151,7 +354,7 @@ int send_encrypted(
     );
 
     int result =
-        send_all(
+        send_framed(
             socket,
             encrypted,
             (int)strlen(encrypted)
@@ -409,6 +612,42 @@ void handle_send_command(
 
 
     /*
+     * Snapshot the target's socket + key under the lock so
+     * this thread never touches another client's slot without
+     * holding clients_lock, and so we don't hold the lock
+     * across the network send below.
+     */
+
+    SOCKET target_socket;
+    char target_key[MAX_KEY];
+
+    if (!snapshot_client(
+            target_index,
+            &target_socket,
+            target_key,
+            sizeof(target_key)
+        )) {
+
+        char error_message[BUFFER_SIZE];
+
+        snprintf(
+            error_message,
+            sizeof(error_message),
+            "ERROR %s is not online",
+            target_username
+        );
+
+        send_encrypted(
+            clients[sender_index].socket,
+            error_message,
+            clients[sender_index].key
+        );
+
+        return;
+    }
+
+
+    /*
      * Build outgoing message.
      */
 
@@ -449,14 +688,14 @@ void handle_send_command(
 
     encrypt_text(
         outgoing_message,
-        clients[target_index].key,
+        target_key,
         encrypted
     );
 
 
     int result =
-        send_all(
-            clients[target_index].socket,
+        send_framed(
+            target_socket,
             encrypted,
             (int)strlen(encrypted)
         );
@@ -763,6 +1002,40 @@ void handle_file_command(
 
 
     /*
+     * Snapshot the target's socket + key under the lock
+     * (see handle_send_command for why).
+     */
+
+    SOCKET target_socket;
+    char target_key[MAX_KEY];
+
+    if (!snapshot_client(
+            target_index,
+            &target_socket,
+            target_key,
+            sizeof(target_key)
+        )) {
+
+        char error_message[BUFFER_SIZE];
+
+        snprintf(
+            error_message,
+            sizeof(error_message),
+            "ERROR %s is not online",
+            target_username
+        );
+
+        send_encrypted(
+            clients[sender_index].socket,
+            error_message,
+            clients[sender_index].key
+        );
+
+        return;
+    }
+
+
+    /*
      * Validate hexadecimal data.
      */
 
@@ -874,14 +1147,14 @@ void handle_file_command(
 
     encrypt_text(
         outgoing,
-        clients[target_index].key,
+        target_key,
         encrypted
     );
 
 
     int result =
-        send_all(
-            clients[target_index].socket,
+        send_framed(
+            target_socket,
             encrypted,
             (int)strlen(encrypted)
         );
@@ -916,6 +1189,86 @@ void handle_file_command(
         clients[sender_index].username,
         target_username,
         (unsigned long)file_size
+    );
+}
+
+
+/* ==================================================
+   LIST command
+
+   Plaintext:
+
+       LIST
+
+   Response:
+
+       ONLINE alice, bob, carol
+   ================================================== */
+
+void handle_list_command(
+    int requester_index
+)
+{
+    char list_message[BUFFER_SIZE];
+    int i;
+    int first = 1;
+
+    strncpy(
+        list_message,
+        "ONLINE ",
+        sizeof(list_message) - 1
+    );
+
+    list_message[sizeof(list_message) - 1] = '\0';
+
+    EnterCriticalSection(&clients_lock);
+
+    for (i = 0; i < MAX_CLIENTS; i++) {
+
+        if (!clients[i].active) {
+            continue;
+        }
+
+        if (!first) {
+
+            strncat(
+                list_message,
+                ", ",
+                sizeof(list_message) - strlen(list_message) - 1
+            );
+        }
+
+        strncat(
+            list_message,
+            clients[i].username,
+            sizeof(list_message) - strlen(list_message) - 1
+        );
+
+        first = 0;
+    }
+
+    LeaveCriticalSection(&clients_lock);
+
+    if (first) {
+
+        /*
+         * No one else online (or this client is the only
+         * connected user); keep a trailing space off.
+         */
+
+        strncpy(
+            list_message,
+            "ONLINE (none)",
+            sizeof(list_message) - 1
+        );
+
+        list_message[sizeof(list_message) - 1] = '\0';
+    }
+
+    send_encrypted(
+        clients[requester_index].socket,
+        list_message,
+        clients[requester_index].key
     );
 }
 
@@ -976,18 +1329,19 @@ DWORD WINAPI handle_client(
      */
 
     bytes_received =
-        recv(
+        recv_framed(
             client_socket,
             registration_buffer,
-            BUFFER_SIZE - 1,
-            0
+            BUFFER_SIZE - 1
         );
 
 
     if (bytes_received <= 0) {
 
         printf(
-            "Client disconnected before registration.\n"
+            bytes_received == 0
+                ? "Client disconnected before registration.\n"
+                : "Malformed registration frame received.\n"
         );
 
         closesocket(
@@ -1060,14 +1414,67 @@ DWORD WINAPI handle_client(
 
     /*
      * ----------------------------------------------
-     * Duplicate username
+     * Duplicate-username check + free-slot reservation,
+     * done as ONE atomic step under clients_lock.
+     *
+     * Doing these as two separate locked calls (as
+     * before) leaves a window where two threads
+     * registering the same username, or racing for the
+     * last free slot, could both pass their individual
+     * checks before either one stores its client. Taking
+     * the lock once for both checks -- and reserving the
+     * slot (active = 1) before releasing it -- closes
+     * that window.
      * ----------------------------------------------
      */
 
-    if (
-        find_client_by_username(username)
-        != -1
-    ) {
+    int client_index = -1;
+    int duplicate = 0;
+
+    EnterCriticalSection(&clients_lock);
+
+    {
+        int i;
+
+        for (i = 0; i < MAX_CLIENTS; i++) {
+
+            if (clients[i].active &&
+                strcmp(clients[i].username, username) == 0) {
+
+                duplicate = 1;
+                break;
+            }
+        }
+
+        if (!duplicate) {
+
+            for (i = 0; i < MAX_CLIENTS; i++) {
+
+                if (!clients[i].active) {
+                    client_index = i;
+                    break;
+                }
+            }
+
+            if (client_index != -1) {
+
+                /*
+                 * Reserve the slot immediately so no other
+                 * thread can claim it or register the same
+                 * username before this thread finishes
+                 * filling it in below.
+                 */
+
+                clients[client_index].active = 1;
+                clients[client_index].username[0] = '\0';
+            }
+        }
+    }
+
+    LeaveCriticalSection(&clients_lock);
+
+
+    if (duplicate) {
 
         char response[
             BUFFER_SIZE
@@ -1097,16 +1504,6 @@ DWORD WINAPI handle_client(
     }
 
 
-    /*
-     * ----------------------------------------------
-     * Check server capacity
-     * ----------------------------------------------
-     */
-
-    int client_index =
-        find_free_client();
-
-
     if (client_index == -1) {
 
         send_encrypted(
@@ -1130,6 +1527,8 @@ DWORD WINAPI handle_client(
      * ----------------------------------------------
      */
 
+    EnterCriticalSection(&clients_lock);
+
     clients[client_index].socket =
         client_socket;
 
@@ -1148,6 +1547,8 @@ DWORD WINAPI handle_client(
 
     clients[client_index].active =
         1;
+
+    LeaveCriticalSection(&clients_lock);
 
 
     printf(
@@ -1191,8 +1592,10 @@ DWORD WINAPI handle_client(
         );
 
 
+        EnterCriticalSection(&clients_lock);
         clients[client_index].active =
             0;
+        LeaveCriticalSection(&clients_lock);
 
 
         closesocket(
@@ -1226,6 +1629,8 @@ DWORD WINAPI handle_client(
         );
 
 
+        EnterCriticalSection(&clients_lock);
+
         clients[client_index].active =
             0;
 
@@ -1236,6 +1641,8 @@ DWORD WINAPI handle_client(
 
         clients[client_index].key[0] =
             '\0';
+
+        LeaveCriticalSection(&clients_lock);
 
 
         closesocket(
@@ -1260,16 +1667,37 @@ DWORD WINAPI handle_client(
     while (1) {
 
         bytes_received =
-            recv(
+            recv_framed(
                 client_socket,
                 buffer,
-                MAX_NETWORK_BUFFER - 1,
-                0
+                MAX_NETWORK_BUFFER - 1
             );
 
 
-        if (bytes_received <= 0) {
+        if (bytes_received == 0) {
             break;
+        }
+
+        if (bytes_received < 0) {
+
+            /*
+             * Malformed frame / garbage bytes / oversized
+             * frame. Per the spec the server must never
+             * crash on this -- log it and keep the
+             * connection open rather than tearing it down,
+             * unless the underlying socket is actually
+             * gone (recv_framed already folds that into a
+             * negative return too, so just try again; the
+             * next recv_framed() call will report 0 once
+             * the peer is truly gone).
+             */
+
+            printf(
+                "Malformed/garbage frame from %s, ignoring.\n",
+                username
+            );
+
+            continue;
         }
 
 
@@ -1452,6 +1880,25 @@ DWORD WINAPI handle_client(
 
         /*
          * ------------------------------------------
+         * LIST online users
+         * ------------------------------------------
+         */
+
+        else if (
+            strcmp(
+                decrypted,
+                "LIST"
+            ) == 0
+        ) {
+
+            handle_list_command(
+                client_index
+            );
+        }
+
+
+        /*
+         * ------------------------------------------
          * Unknown command
          * ------------------------------------------
          */
@@ -1491,6 +1938,8 @@ DWORD WINAPI handle_client(
     );
 
 
+    EnterCriticalSection(&clients_lock);
+
     clients[client_index].active =
         0;
 
@@ -1501,6 +1950,8 @@ DWORD WINAPI handle_client(
 
     clients[client_index].key[0] =
         '\0';
+
+    LeaveCriticalSection(&clients_lock);
 
 
     closesocket(
@@ -1532,6 +1983,9 @@ int main(
         0,
         sizeof(clients)
     );
+
+
+    InitializeCriticalSection(&clients_lock);
 
 
     /*
