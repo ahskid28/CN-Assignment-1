@@ -118,6 +118,33 @@ the TCP socket, including:
 The receiver decrypts the ciphertext using the appropriate key before
 processing the command or displaying the message.
 
+### Registration Handshake
+
+The `REGISTER` command is a special case: it is the message that tells
+the server which key to use for a given client, so it cannot be
+encrypted with that same key — the server has no way to decrypt it
+without already knowing the key it's supposed to learn from it.
+
+To keep this step encrypted anyway (rather than sending it in plaintext),
+client and server share a **fixed bootstrap key**,
+`CN25_REGISTRATION_HANDSHAKE_KEY`, hard-coded identically in both
+`client.c` and `server.c`. This key is used only for:
+
+- The outgoing `REGISTER <username> KEY <key>` command
+- The server's `REGISTERED <username>` / `ERROR ...` reply to it
+
+Once registration succeeds, the client's own key (the one it registered
+with) is used for everything else — chat messages, file transfers, and
+all subsequent server responses.
+
+**Known limitation:** the bootstrap key is a shared secret baked into
+both binaries, not something negotiated per-connection. It only
+prevents the registration handshake from appearing in cleartext on the
+wire; it does not provide the security properties a real key-exchange
+protocol (e.g. Diffie–Hellman, or TLS-negotiated keys) would give. This
+is a reasonable simplification for the scope of this assignment, but a
+production system would need a proper key-exchange step here.
+
 ### Different Keys for Different Users
 
 Each registered client has its own encryption key.
@@ -131,6 +158,8 @@ When Alice sends a message to Bob, the server uses Bob's registered key
 when preparing the message for Bob. Therefore, the ciphertext transmitted
 on the sender side can differ from the ciphertext transmitted on the
 receiver side even though the underlying plaintext message is the same.
+The bootstrap key described above is separate from these per-user keys
+and is never used to encrypt chat or file-transfer traffic.
 
 ### Known Weakness
 
@@ -186,7 +215,17 @@ ERROR unknown command
 
 ### Disconnect
 
-When a client disconnects, the corresponding client state is cleaned up and its socket is closed.
+Two disconnect paths are supported:
+
+- **Graceful (`QUIT`)** — the client sends an encrypted `QUIT` command.
+  The server replies `GOODBYE <username>` (encrypted with the client's
+  own key), then cleans up the client's slot and closes the socket.
+- **Abrupt (Ctrl+C, crash, network drop)** — the server detects this
+  when `recv()` returns 0 or an error, and runs the same cleanup path
+  without sending a reply (there is no live connection to reply on).
+
+In both cases, the client's table entry is cleared and its socket is
+closed without affecting any other connected client.
 
 ---
 
@@ -235,6 +274,7 @@ Files exceeding the limit are rejected. The file protocol uses length-aware fram
 | Duplicate username rejected | Completed |
 | Offline recipient rejected | Completed |
 | Abrupt client disconnect handled | Completed |
+| Graceful disconnect (`QUIT` → `GOODBYE`) | Completed |
 | Malformed/garbage input handled | Completed |
 | Two clients with different keys communicate | Completed |
 | Wireshark different-ciphertext verification | Completed |
@@ -307,6 +347,15 @@ rather than direct end-to-end encryption.
 ### Registration
 
 The assignment's simplified registration protocol supplies the username and key during registration. A production system would require a secure key-establishment mechanism.
+
+### Registration handshake key
+
+The `REGISTER` command is encrypted with a fixed, shared bootstrap key
+rather than a per-user key, since the per-user key itself is what's
+being communicated in that message. This closes the plaintext gap for
+registration traffic but relies on both binaries embedding the same
+constant — a real deployment would replace this with a proper
+key-exchange mechanism.
 
 ### Cryptographic strength
 
