@@ -128,8 +128,9 @@ without already knowing the key it's supposed to learn from it.
 To keep this step encrypted anyway (rather than sending it in plaintext),
 client and server share a **fixed bootstrap key**,
 `CN25_REGISTRATION_HANDSHAKE_KEY`, hard-coded identically in both
-`client.c` and `server.c`. This key is used only for:
+`client.c` and `server.c`. 
 
+This key is used only for:
 - The outgoing `REGISTER <username> KEY <key>` command
 - The server's `REGISTERED <username>` / `ERROR ...` reply to it
 
